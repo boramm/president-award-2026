@@ -494,6 +494,7 @@
   <div class="header-right">
     <div style="font-size:13px;color:var(--gray-dark);display:flex;align-items:center;gap:8px">
       <span id="fbStatus" style="font-size:11px;padding:4px 10px;border-radius:var(--radius-pill);background:var(--gray-bg);font-weight:600">🔄 연결 확인 중...</span>
+      <span id="syncBadge" style="display:none;font-size:11px;padding:4px 10px;border-radius:var(--radius-pill);font-weight:700;cursor:help"></span>
       <span id="evaluatorLabel" style="font-size:12px;font-weight:600;color:var(--gray-mid)">심사위원:</span>
       <span id="evaluatorBadge" style="font-size:13px;font-weight:800;color:var(--rausch-dark)">-</span>
       <button class="btn btn-outline btn-sm" id="myBackupBtn" onclick="exportMyEvaluations()">💾 내 평가 백업</button>
@@ -587,9 +588,11 @@
         </div>
         <div style="display:flex;gap:8px">
           <button class="btn btn-outline" onclick="window.print()">🖨️ 결과 인쇄</button>
+          <button class="btn btn-outline" id="adminCsvBtn" onclick="exportResultsCsv()" style="display:none">📊 엑셀 다운로드</button>
           <button class="btn btn-outline" id="adminResetBtn" onclick="adminClearData()" style="display:none;color:var(--rausch);border-color:var(--rausch)">🗑️ 데이터 초기화</button>
         </div>
       </div>
+      <div id="adminProgress" style="display:none"></div>
       <div id="dashboardCards" style="display:flex;flex-direction:column;gap:20px"></div>
     </div>
   </div>
@@ -604,6 +607,7 @@
         <strong>🔍 Firebase 실시간 연결 상태:</strong><br>
         <span id="adminFbDetail">확인 중...</span>
       </div>
+      <button class="btn btn-rausch" style="width:100%;justify-content:center" onclick="exportResultsCsv()">📊 결과 엑셀(CSV) 다운로드</button>
       <button class="btn btn-outline" style="width:100%;justify-content:center" onclick="exportDataJson()">📥 전체 평가 데이터 JSON 백업</button>
 
       <div id="adminImportSection" style="border-top:1px solid var(--gray-border);padding-top:14px;margin-top:2px">
@@ -1055,7 +1059,9 @@ function applyLogin(id) {
     document.getElementById('evaluatorBadge').textContent = `${ADMIN.name} (${ADMIN.title})`;
     document.getElementById('adminBtn').style.display = 'inline-flex';
     document.getElementById('adminResetBtn').style.display = 'inline-flex';
+    document.getElementById('adminCsvBtn').style.display = 'inline-flex';
     document.getElementById('myBackupBtn').style.display = 'none';
+    startPresenceListener();
     return true;
   }
   const ev = findEvaluatorByEmpId(id);
@@ -1112,6 +1118,8 @@ function doLogin() {
   document.getElementById('loginOverlay').style.display = 'none';
   renderCandList();
   if (currentCandId) selectCand(currentCandId);
+  updateSyncBadge();
+  resyncAfterLogin();
 
   if (isAdmin) {
     showTab('dashboard');
@@ -1125,6 +1133,8 @@ function doLogin() {
 }
 
 function logout() {
+  const n = pendingMine().length;
+  if (n && !confirm(`아직 서버로 전송되지 않은 평가가 ${n}건 있습니다.\n이 기기에는 보관되어 있으며, 같은 기기·브라우저로 다시 접속하면 자동 전송됩니다.\n\n그래도 로그아웃하시겠습니까?`)) return;
   localStorage.removeItem(LOGIN_STORAGE_KEY);
   location.reload();
 }
@@ -1215,16 +1225,30 @@ function promptFinalSubmit(fromAutoPrompt) {
 
 function finalSubmitAll() {
   const now = new Date().toISOString();
+  const writes = [];
   myAssigned().forEach(c => {
     const r = myEvalOf(c.id);
     if (!r || r.submitted) return;
     const rec = { ...r, submitted: true, submittedAt: now, updatedAt: now };
     upsertRecord(rec);
-    writeRecordToFirebase(rec, false);
+    writes.push(writeRecordToFirebase(rec, false));
   });
   renderCandList();
   if (currentCandId) renderEvalForm(getCand(currentCandId));
-  showToast('✅ 최종 제출 완료! 수고하셨습니다.', 'success');
+
+  // 서버가 실제로 받았는지 확인한 뒤에 완료를 알림
+  showToast('제출 내용을 서버에 저장하는 중입니다...');
+  let settled = false;
+  Promise.all(writes).then(() => {
+    settled = true;
+    showToast('✅ 최종 제출 완료! 서버 저장까지 확인했습니다. 수고하셨습니다.', 'success');
+  }).catch(() => {
+    settled = true;
+    alert('⚠️ 제출 내용이 서버에 저장되지 않았습니다.\n\n이 기기에는 보관되어 있습니다. 인터넷 연결을 확인한 뒤 이 화면을 새로고침하면 자동으로 다시 전송됩니다.\n계속 문제가 있으면 총무인사팀에 알려주세요.');
+  });
+  setTimeout(() => {
+    if (!settled) alert('⚠️ 서버 응답이 늦어지고 있습니다.\n\n인터넷 연결을 확인해주세요. 연결되면 자동으로 전송되며, 상단 표시가 "☁️ 서버 저장 확인됨"으로 바뀌면 완료된 것입니다.');
+  }, 10000);
 }
 
 /* ===================== Firebase 저장/동기화 ===================== */
@@ -1245,25 +1269,91 @@ function upsertRecord(r) {
   saveToLocalStorage();
 }
 
+/* 서버 수신 확인(ack): 서버가 실제로 받은 기록의 updatedAt을 기억 → 기기에만 있는(미전송) 평가를 찾아냄 */
+const ACK_STORAGE_KEY = 'syu_award_eval_ack';
+let ackMap = {};
+let firstSnapshot = true;
+let presenceMap = {};
+
+function pendingMine() {
+  if (!currentEvaluator) return [];
+  return records.filter(r => r.evaluator === currentEvaluator && ackMap[recordKey(r.candId, r.evaluator)] !== r.updatedAt);
+}
+
+function updateSyncBadge() {
+  const el = document.getElementById('syncBadge');
+  if (!el) return;
+  if (!currentEvaluator) { el.style.display = 'none'; return; }
+  const n = pendingMine().length;
+  el.style.display = 'inline-block';
+  el.textContent = n ? `⚠️ 서버 미전송 ${n}건` : '☁️ 서버 저장 확인됨';
+  el.style.color = n ? '#dc2626' : '#1F4E8C';
+  el.style.background = n ? '#fee2e2' : '#EAF2FB';
+  el.title = n ? '인터넷 연결을 확인하세요. 연결되면 자동 전송됩니다. 이 상태로 브라우저 기록을 지우면 평가가 사라질 수 있습니다.' : '저장한 평가가 모두 서버에 기록되었습니다.';
+}
+
+/* 위원 기기의 상태를 서버에 보고 → 관리자가 '기기 저장 건수 vs 서버 건수'를 비교 */
+function reportPresence() {
+  if (!currentEvaluator || !window._fbReady) return;
+  const p = myProgress();
+  const { _fbDb: db, _fbRef: ref, _fbSet: set } = window;
+  set(ref(db, `${FB_PATH}/presence/${currentEvaluator}`), {
+    name: currentEvaluator, lastSeen: new Date().toISOString(),
+    assigned: p.total, saved: p.done, submitted: p.submitted, pending: pendingMine().length
+  }).catch(err => console.warn('접속 기록 실패:', err));
+}
+
+function startPresenceListener() {
+  if (!window._fbReady) return;
+  const { _fbDb: db, _fbRef: ref, _fbOnValue: onValue } = window;
+  onValue(ref(db, FB_PATH + '/presence'), (snap) => {
+    presenceMap = snap.val() || {};
+    updateDashboard();
+  }, (err) => console.warn('접속 기록 수신 오류:', err));
+}
+
 /* 서버 값을 기준으로 하되, 내 평가 중 서버에 없거나 더 최신인 것은 서버로 올림 (다른 위원의 캐시는 올리지 않음) */
+/* authoritative=true : 서버에 실제로 있는 값(첫 수신·로그인 직후 재조회) → 일치하는 내 기록을 수신 확인 처리
+   이후 실시간 수신값에는 아직 서버 확인 전인 내 쓰기가 섞일 수 있어 확인 처리하지 않음 */
+function handleServerSnapshot(val, authoritative) {
+  const merged = new Map(normalizeEvaluations(val).map(r => [recordKey(r.candId, r.evaluator), r]));
+  if (authoritative && currentEvaluator) {
+    merged.forEach((r, key) => { if (r.evaluator === currentEvaluator) ackMap[key] = r.updatedAt; });
+    saveAck();
+  }
+  records.forEach(local => {
+    const key = recordKey(local.candId, local.evaluator);
+    const server = merged.get(key);
+    if (server && recTime(local) <= recTime(server)) return;
+    // 서버보다 새로운 기기 기록은 지우지 않고 보존 (로그아웃 상태여도 유실 방지). 서버 전송은 본인 것만
+    merged.set(key, local);
+    if (currentEvaluator && local.evaluator === currentEvaluator) writeRecordToFirebase(local, false);
+  });
+  setRecords([...merged.values()]);
+  saveToLocalStorage();
+  renderCandList();
+  updateDashboard();
+  updateSyncBadge();
+}
+
+/* 로그인 직후: 서버를 한 번 다시 읽어 내 기록의 서버 반영 여부를 확인하고 미전송분을 올림 */
+function resyncAfterLogin() {
+  if (!window._fbReady || !currentEvaluator) return;
+  const { _fbDb: db, _fbRef: ref, _fbGet: get } = window;
+  get(ref(db, FB_PATH + '/evaluations')).then(snap => {
+    handleServerSnapshot(snap.val(), true);
+    reportPresence();
+  }).catch(err => console.warn('재조회 실패:', err));
+}
+
 function startFirebaseListener() {
   if (!window._fbReady) return;
   const { _fbDb: db, _fbRef: ref, _fbOnValue: onValue } = window;
   onValue(ref(db, FB_PATH + '/evaluations'), (snap) => {
-    const merged = new Map(normalizeEvaluations(snap.val()).map(r => [recordKey(r.candId, r.evaluator), r]));
-    records.forEach(local => {
-      if (!currentEvaluator || local.evaluator !== currentEvaluator) return;
-      const key = recordKey(local.candId, local.evaluator);
-      const server = merged.get(key);
-      if (!server || recTime(local) > recTime(server)) {
-        merged.set(key, local);
-        writeRecordToFirebase(local, false);
-      }
-    });
-    setRecords([...merged.values()]);
-    saveToLocalStorage();
-    renderCandList();
-    updateDashboard();
+    const authoritative = firstSnapshot;
+    firstSnapshot = false;
+    handleServerSnapshot(snap.val(), authoritative);
+    if (authoritative) setTimeout(reportPresence, 1500);
   }, (err) => {
     console.warn('Firebase 수신 오류:', err);
     const el = document.getElementById('fbStatus');
@@ -1279,24 +1369,38 @@ function loadFromLocalStorage() {
   try {
     const saved = localStorage.getItem(LOCAL_STORAGE_KEY);
     if (saved) setRecords(normalizeEvaluations(JSON.parse(saved)));
+    ackMap = JSON.parse(localStorage.getItem(ACK_STORAGE_KEY) || '{}') || {};
   } catch (e) {}
+}
+function saveAck() {
+  try { localStorage.setItem(ACK_STORAGE_KEY, JSON.stringify(ackMap)); } catch (e) {}
 }
 
 /* 평가 1건만 자기 자리에 저장 - 다른 사람의 평가를 절대 덮어쓰지 않음
    오프라인이어도 set을 호출하면 Firebase SDK가 보관했다가 재연결 시 자동 전송함 */
 function writeRecordToFirebase(record, showToastOnIssue = true) {
   saveToLocalStorage();
+  updateSyncBadge();
   if (!window._fbReady) {
     if (showToastOnIssue) showToast('⚠️ 서버 연결 불가: 기기에 임시 보관되었습니다.', 'error');
-    return;
+    return Promise.reject(new Error('firebase not ready'));
   }
   if (!window._isConnected && showToastOnIssue) showToast('⚠️ 오프라인 상태: 연결되면 자동 전송됩니다.', 'error');
   const { _fbDb: db, _fbRef: ref, _fbSet: set } = window;
   const key = recordKey(record.candId, record.evaluator);
-  set(ref(db, `${FB_PATH}/evaluations/${key}`), record).catch(err => {
+  const p = set(ref(db, `${FB_PATH}/evaluations/${key}`), record);
+  p.then(() => {
+    // 그 사이 더 새로 저장한 게 없을 때만 확인 처리
+    const cur = records.find(r => recordKey(r.candId, r.evaluator) === key);
+    if (cur && cur.updatedAt === record.updatedAt) { ackMap[key] = record.updatedAt; saveAck(); }
+    updateSyncBadge();
+    if (record.evaluator === currentEvaluator) reportPresence();
+  }).catch(err => {
     console.warn('Firebase 전송 실패:', err);
     showToast('❌ 서버 저장 실패: 기기에만 보관됨. 관리자에게 알려주세요.', 'error');
+    updateSyncBadge();
   });
+  return p;
 }
 
 function tombstone(candId, evaluator) {
@@ -1610,29 +1714,95 @@ function getScoringSet(evals) {
   return sorted.slice(1, -1);
 }
 
+/* 부문별 결과 (최종 제출된 평가만, 테스트 계정 제외) - 대시보드와 엑셀 다운로드가 같은 계산을 사용 */
+function computeCategoryResults(ck) {
+  const cat = CATEGORIES[ck];
+  return appData.candidates.filter(c => c.cat === ck).map(c => {
+    const evals = appData.evaluations.filter(e => e.candId === c.id && e.submitted && !isTestRecord(e));
+    const eligible = EVALUATORS.length - (c.recuse ? c.recuse.length : 0);
+    if (evals.length === 0) return { ...c, avgs: {}, avgTotal: 0, count: 0, eligible, trimmed: false };
+
+    const set = getScoringSet(evals);
+    const n = set.length;
+    const avgs = {};
+    cat.items.forEach(it => {
+      avgs[it.key] = set.reduce((s, e) => s + ((e.scores && e.scores[it.key]) || 0), 0) / n;
+    });
+    const avgTotal = set.reduce((s, e) => s + e.total, 0) / n;
+    return { ...c, avgs, avgTotal, count: evals.length, eligible, trimmed: TRIM_HIGH_LOW && evals.length >= 3 };
+  }).sort((a, b) => b.avgTotal - a.avgTotal);
+}
+
+function fmtTime(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return '-';
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getMonth() + 1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/* 관리자 전용: 위원별 진행 현황 - 서버에 들어온 평가와 위원 기기가 보고한 상태를 비교 */
+function evaluatorProgressRows() {
+  const list = [...EVALUATORS, TEST_EVALUATOR];
+  return list.map(ev => {
+    const assigned = appData.candidates.filter(c => !(c.recuse || []).includes(ev.name));
+    const mine = appData.evaluations.filter(r => r.evaluator === ev.name);
+    const serverDone = assigned.filter(c => isCompleteRec(mine.find(r => r.candId === c.id), c)).length;
+    const submitted = assigned.length > 0 && assigned.every(c => { const r = mine.find(x => x.candId === c.id); return r && r.submitted; });
+    const pres = presenceMap[ev.name];
+    let status, warn = '';
+    if (submitted) status = '<span style="color:var(--green);font-weight:800">✅ 제출 완료</span>';
+    else if (serverDone > 0 || (pres && pres.saved > 0)) status = '<span style="color:var(--rausch);font-weight:700">✏️ 진행 중</span>';
+    else if (pres) status = '<span style="color:var(--gray-mid)">접속함 · 미입력</span>';
+    else status = '<span style="color:var(--gray-light)">접속 기록 없음</span>';
+    if (pres && pres.pending > 0) warn = `⚠️ 기기에만 ${pres.pending}건 (미전송)`;
+    else if (pres && pres.saved > serverDone) warn = `⚠️ 기기 ${pres.saved}건 > 서버 ${serverDone}건`;
+    else if (pres && pres.submitted && !submitted) warn = '⚠️ 기기에선 제출, 서버 미반영';
+    return { ev, assigned: assigned.length, serverDone, submitted, pres, status, warn, isTest: ev === TEST_EVALUATOR };
+  });
+}
+
+function renderAdminProgress() {
+  const box = document.getElementById('adminProgress');
+  if (!box) return;
+  if (!isAdmin) { box.style.display = 'none'; return; }
+  const rows = evaluatorProgressRows();
+  const real = rows.filter(r => !r.isTest);
+  const doneCnt = real.filter(r => r.submitted).length;
+  const warnCnt = real.filter(r => r.warn).length;
+  box.style.display = 'block';
+  box.innerHTML = `
+    <div class="dashboard-card">
+      <div class="dashboard-card-head"><h3>🔍 심사위원별 진행 현황 (관리자 전용)</h3>
+        <span>제출 완료 ${doneCnt}/${real.length}명${warnCnt ? ` · <b style="color:var(--red)">확인 필요 ${warnCnt}명</b>` : ''}</span></div>
+      <table class="result-table">
+        <thead><tr><th style="text-align:left;padding-left:20px">심사위원</th><th>담당</th><th>서버 저장</th><th>상태</th><th>마지막 접속</th><th>기기 보고</th><th style="text-align:left">점검</th></tr></thead>
+        <tbody>${rows.map(r => `
+          <tr style="${r.isTest ? 'opacity:0.55' : ''}${r.warn ? ';background:#fff5f5' : ''}">
+            <td style="text-align:left;padding-left:20px"><strong>${esc(r.ev.name)}</strong> <span style="font-size:11px;color:var(--gray-mid)">${esc(r.ev.title)}</span></td>
+            <td>${r.assigned}</td>
+            <td><strong>${r.serverDone}</strong> / ${r.assigned}</td>
+            <td>${r.status}</td>
+            <td>${r.pres ? fmtTime(r.pres.lastSeen) : '-'}</td>
+            <td>${r.pres ? `저장 ${r.pres.saved} · 미전송 ${r.pres.pending}` : '-'}</td>
+            <td style="text-align:left;color:var(--red);font-weight:700">${r.warn || '<span style="color:var(--gray-light);font-weight:500">이상 없음</span>'}</td>
+          </tr>`).join('')}</tbody>
+      </table>
+      <div style="padding:10px 20px;font-size:11px;color:var(--gray-mid);line-height:1.6">
+        "서버 저장"은 서버에 실제로 들어온 채점 완료 건수, "기기 보고"는 위원 PC가 마지막 접속 때 알려온 상태입니다.
+        두 값이 다르거나 미전송이 있으면 ⚠️로 표시됩니다. 해당 위원에게 같은 PC·브라우저로 다시 접속해 상단에 "☁️ 서버 저장 확인됨"이 보이는지 확인하도록 안내해주세요.
+      </div>
+    </div>`;
+}
+
 function updateDashboard() {
   const wrap = document.getElementById('dashboardCards');
   if (!wrap) return;
+  renderAdminProgress();
 
   wrap.innerHTML = Object.keys(CATEGORIES).map(ck => {
     const cat = CATEGORIES[ck];
-    const cands = appData.candidates.filter(c => c.cat === ck);
-    if (cands.length === 0) return '';
-
-    const results = cands.map(c => {
-      const evals = appData.evaluations.filter(e => e.candId === c.id && e.submitted && !isTestRecord(e));
-      const eligible = EVALUATORS.length - (c.recuse ? c.recuse.length : 0);
-      if (evals.length === 0) return { ...c, avgs: {}, avgTotal: 0, count: 0, eligible, trimmed: false };
-
-      const set = getScoringSet(evals);
-      const n = set.length;
-      const avgs = {};
-      cat.items.forEach(it => {
-        avgs[it.key] = set.reduce((s, e) => s + ((e.scores && e.scores[it.key]) || 0), 0) / n;
-      });
-      const avgTotal = set.reduce((s, e) => s + e.total, 0) / n;
-      return { ...c, avgs, avgTotal, count: evals.length, eligible, trimmed: TRIM_HIGH_LOW && evals.length >= 3 };
-    }).sort((a, b) => b.avgTotal - a.avgTotal);
+    const results = computeCategoryResults(ck);
+    if (results.length === 0) return '';
 
     const rows = results.map((r, idx) => {
       const rankClass = idx === 0 ? 'rank-1' : idx === 1 ? 'rank-2' : idx === 2 ? 'rank-3' : 'rank-other';
@@ -1737,6 +1907,56 @@ function adminDeleteSingleEvaluation() {
   updateDashboard();
   populateAdminDeleteCandSelect();
   showToast(`${label} - ${evaluator} 평가가 삭제되었습니다.`, 'success');
+}
+
+/* 엑셀에서 바로 열리는 CSV (한글 깨짐 방지 BOM 포함): ① 부문별 최종 순위 ② 위원별 상세 점수 ③ 위원별 진행 현황 */
+function exportResultsCsv() {
+  if (!isAdmin) return;
+  const cell = v => { const s = String(v == null ? '' : v); return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+  const rows = [];
+  const add = arr => rows.push(arr.map(cell).join(','));
+  const n1 = v => (Math.round(v * 10) / 10).toFixed(1);
+
+  add([`2026 총장상 심사 결과 (다운로드 ${fmtTime(new Date().toISOString())}, 최종 제출된 평가만 반영${TRIM_HIGH_LOW ? ' · 최고점·최저점 각 1건 제외 평균' : ''})`]);
+  rows.push('');
+  add(['[1] 부문별 최종 순위']);
+  Object.keys(CATEGORIES).forEach(ck => {
+    const cat = CATEGORIES[ck];
+    add([cat.label, `${cat.slotsLabel}`]);
+    add(['순위', '성명/부서', '소속', ...cat.items.map(it => `${it.short}(${it.max})`), '총점 평균(100)', '제출 인원', '평가 가능 인원', '선정권']);
+    computeCategoryResults(ck).forEach((r, i) => {
+      add([r.count ? i + 1 : '-', r.name, r.org, ...cat.items.map(it => r.count ? n1(r.avgs[it.key]) : ''),
+        r.count ? n1(r.avgTotal) : '', r.count, r.eligible, r.count && i < cat.slots ? '선정권' : '']);
+    });
+    rows.push('');
+  });
+
+  add(['[2] 심사위원별 상세 점수 (테스트 계정 제외)']);
+  add(['부문', '후보', '소속', '심사위원', '항목1', '항목2', '항목3', '항목4', '항목5', '총점', '상태', '저장 시각', '코멘트']);
+  appData.candidates.forEach(c => {
+    const cat = CATEGORIES[c.cat];
+    appData.evaluations.filter(r => r.candId === c.id && !isTestRecord(r)).forEach(r => {
+      const sc = cat.items.map(it => (r.scores || {})[it.key] ?? '');
+      while (sc.length < 5) sc.push('');
+      add([cat.label, c.name, c.org, r.evaluator, ...sc, r.total, r.submitted ? '제출' : '저장(미제출)', fmtTime(r.updatedAt), r.comment || '']);
+    });
+  });
+  rows.push('');
+
+  add(['[3] 심사위원별 진행 현황']);
+  add(['심사위원', '직위', '담당', '서버 저장(채점 완료)', '최종 제출', '마지막 접속', '기기 보고 저장', '기기 보고 미전송', '점검']);
+  evaluatorProgressRows().filter(r => !r.isTest).forEach(r => {
+    add([r.ev.name, r.ev.title, r.assigned, r.serverDone, r.submitted ? '완료' : '미완료',
+      r.pres ? fmtTime(r.pres.lastSeen) : '접속 기록 없음', r.pres ? r.pres.saved : '', r.pres ? r.pres.pending : '', r.warn || '이상 없음']);
+  });
+
+  const blob = new Blob(['﻿' + rows.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `2026_총장상_심사결과_${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  showToast('결과 엑셀(CSV) 파일을 다운로드했습니다.', 'success');
 }
 
 function exportDataJson() {
